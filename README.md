@@ -1,8 +1,11 @@
 # MicroPython-Wireless-Level
 MicroPython server for an embedded device in a wireless level prototype
 
+## Hardware
+This script is designed to run on an Arduino Nano RP2040 Connect. It uses the onboard IMU to measure pitch and roll, and a MLX90393 magnetometer in I2C mode for comapss heading (the prototype uses [this](https://www.sparkfun.com/products/14571) breakout from Sparkfun). The Arduino can optionally use an LED connected to the A0 and A1 pins to indicate when it is powered on. The prototype is powered by 4 AA batteries.
+
 ## Installation
-This script is designed for use on an Arduino Nano RP2040 Connect. Refer to [this](https://docs.arduino.cc/tutorials/nano-rp2040-connect/rp2040-python-api) page for MicroPython installation instructions. After installing MicroPython on your Arduino, clone this repo and flash it to the Arduino.
+Refer to [this](https://docs.arduino.cc/tutorials/nano-rp2040-connect/rp2040-python-api) page for MicroPython installation instructions. After installing MicroPython on your Arduino, clone this repo and flash it to the Arduino.
 
 ## Usage
 After deploying the script and resestting the device, wait until the LED turns on, then wait for an additional 5 seconds until a new Wi-Fi network appears. Connect to the Wi-Fi network from any browser and navigate to http://192.168.1.1. It can take 10 to 15 seconds for the page to load. Your device may warn you that the Wi-Fi network has no connection to the internet. This is expected, you should remain connected to the network.
