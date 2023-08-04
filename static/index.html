@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <title>Wireless Level Prototype</title>
+    <style>
+      html, body, main
+      {
+        height:100%;
+        width:100%;
+        margin: 0;
+        padding: 0;
+      }
+
+      main {
+        background-color: black;
+        display: flex;
+        flex-flow: column;
+      }
+
+      body.level main, body.level canvas {
+        background-color: darkgreen;
+      }
+
+      div {
+        width: 100%;
+        margin: 0;
+        padding: 0;
+      }
+
+      .button-tray {
+        display: flex;
+        flex-flow: row;
+      }
+
+      h1 {
+        color: white;
+        font-size: 3em;
+      }
+
+      pre {
+        color: white;
+        font-size: 2em;
+        margin: 10px;
+      }
+
+      .calibrate-only {
+        display: none;
+      }
+
+      .calibrating .calibrate-only {
+        display: block;
+      }
+
+      .calibrating .level-only {
+        display: none;
+      }
+
+      button {
+        border: 2px solid white;
+        color: white;
+        background-color: black;
+        padding: 8px;
+        text-align: center;
+        font-size: 22px;
+        margin: 4px 10px;
+        cursor: pointer;
+      }
+
+      input {
+        font-size: 22px;
+      }
+
+      label {
+        color: white;
+        background-color: black;
+        padding: 8px;
+        text-align: center;
+        font-size: 22px;
+        margin: 4px 10px;
+      }
+
+      button:hover {
+        background-color: #333333;
+      }
+
+      canvas
+      {
+        background: black;
+        height:100%;
+        width: 100%;
+        margin: 0;
+        padding: 0;
+      }
+    </style>
+  </head>
+  <body class="">
+    <main>
+      <div>
+        <h1 style="text-align: center">Wireless Level Prototype</h1>
+        <pre id="sensor-reading">Waiting for data</pre>
+        <div id="button-tray" class="button-tray">
+          <button id="toggle-calibration" type="button">Show Compass Calibration</button>
+          <button class="level-only" id="tare" type="button">Tare</button>
+          <button class="level-only" id="reset-tare" type="button">Reset Tare</button>
+          <button class="calibrate-only" id="calibrate" type="button">Calibrate</button>
+          <button class="calibrate-only" id="reset-calibration" type="button">Reset Calibration</button>
+          <label class="calibrate-only" for="declination">Magnetic Declination (°E)</label>
+          <input class="calibrate-only" type="number" id="declination" name="declination" min="-90" max="90">
+        </div>
+      </div>
+
+      <canvas id="level-canvas"></canvas>
+
+    </main>
+  </body>
+  <script>
+    let socket = null;
+    let calibrating = false
+    let calibration_data_raw = [[], [], []]
+    let last_data = null
+
+    let tare_rotation_matrix = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+
+    function dotProduct(v1, v2) {
+      return v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2]
+    }
+
+    function normalize(v) {
+      let magnitude = Math.sqrt(v.reduce((s, e) => s + e * e, 0))
+      return v.map((e) => e / magnitude)
+    }
+
+    function crossProduct(v1, v2) {
+        return [
+          v1[1] * v2[2] - v1[2] * v2[1],
+          v1[2] * v2[0] - v1[0] * v2[2],
+          v1[0] * v2[1] - v1[1] * v2[0]
+        ]
+    }
+
+    function matrixAdd(m1, m2) {
+      return m1.map((r,i) => r.map((e, j) => e + m2[i][j]))
+    }
+
+    function matrixVectorMultiply(m, v) {
+      return m.map((r) => dotProduct(r, v))
+    }
+
+    function matrixMultiply(m1, m2) {
+      let m = new Array(3);
+      for (let r = 0; r < 3; ++r) {
+        m[r] = new Array(3);
+        for (let c = 0; c < 3; ++c) {
+          m[r][c] = 0;
+          for (let i = 0; i < 3; ++i) {
+            m[r][c] += m1[r][i] * m2[i][c];
+          }
+        }
+      }
+      return m;
+    }
+
+    function elementwiseMultiply(m, s) {
+      return m.map((r) => r.map((e) => e * s))
+    }
+
+    function updatePage(data) {
+      // Updates dynamic content on the page
+      // Runs every time the window is resized or new data is received
+
+      if (data === null) {
+        return
+      }
+
+      // Extract the data from the json object
+      let accel_data = data["raw"]["accel"]
+      let gyro_data = data["raw"]["gyro"]
+      let magnet_data = data["raw"]["magnet"]
+      let hard_iron_offsets = data["calibration"]["hard_iron_offsets"]
+
+      // Get magnetic declination from user setting, or default to the server's latest saved value
+      let declination = document.getElementById("declination").value
+      if (declination === "") {
+        declination = data["calibration"]["declination"]
+        document.getElementById("declination").value = declination
+      }
+
+      // Update raw data readout
+      document.getElementById("sensor-reading").innerHTML =
+              `Accelerometer: x=${accel_data[0].toFixed(2)}, y=${accel_data[1].toFixed(2)}, z=${accel_data[2].toFixed(2)}\n` +
+              `Gyroscope: x=${gyro_data[0].toFixed(2)}, y=${gyro_data[1].toFixed(2)}, z=${gyro_data[2].toFixed(2)}\n` +
+              `Magnetometer: x=${magnet_data[0].toFixed(2)}, y=${magnet_data[1].toFixed(2)}, z=${magnet_data[2].toFixed(2)}`
+
+      // Calculate the degrees from level
+      let tared_accel = matrixVectorMultiply(tare_rotation_matrix, accel_data)
+      let degrees_error = Math.acos(-tared_accel[2] / Math.sqrt(tared_accel[0] ** 2 + tared_accel[1] ** 2 + tared_accel[2] ** 2)) * 180 / Math.PI
+      degrees_error = Math.min(degrees_error, 180 - degrees_error)
+
+
+      if (Math.abs(degrees_error) < 1) {
+        document.body.className = "level"
+      } else {
+        document.body.className = ""
+      }
+
+      // Update canvas
+      let canvas = document.getElementById("level-canvas");
+      let ctx = canvas.getContext("2d");
+      ctx.save()
+
+      // Center the canvas at 0, 0
+      canvas.width = canvas.scrollWidth
+      canvas.height = canvas.scrollHeight
+      ctx.translate(canvas.width / 2, canvas.height/2)
+
+      if (!calibrating) {
+        // Draw level GUI
+        // Draw crosshairs
+        ctx.strokeStyle = "#cccccc"
+        ctx.lineWidth = 2
+        ctx.moveTo(-canvas.width / 2, 0)
+        ctx.lineTo(canvas.width / 2, 0)
+        ctx.stroke()
+
+        ctx.moveTo(0, -canvas.height / 2)
+        ctx.lineTo(0, canvas.height / 2)
+        ctx.stroke()
+
+        let x_err = tared_accel[0] / tared_accel[2]
+        let y_err = -tared_accel[1] / tared_accel[2]
+
+        // Draw bubble
+        ctx.save()
+        ctx.translate(400 * y_err, 400 * x_err)
+
+        ctx.beginPath()
+        ctx.arc(0, 0, 60, 0, 2 * Math.PI)
+        ctx.strokeStyle = "#ffffff"
+        ctx.stroke()
+        ctx.fillStyle = "rgba(255,232,118,0.5)"
+        ctx.fill()
+
+        // Draw bubble text
+        ctx.font = "48px sans-serif"
+        ctx.textAlign = "center"
+        ctx.textBaseline = "middle"
+        ctx.fillStyle = "#ffffff"
+        ctx.fillText(`${degrees_error.toFixed(0)}°`, 0, 5)
+        ctx.restore()
+
+        // Apply hard iron offsets
+        let calibrated_magnet = magnet_data.map((e, i) => e + hard_iron_offsets[i])
+
+        let heading = Math.atan2(calibrated_magnet[0], calibrated_magnet[1])
+
+        heading += declination / 180 * Math.PI
+        heading %= 360
+
+        // Draw compass heading
+        ctx.save()
+        let compass_radius = Math.min(canvas.width, canvas.height) / 2 * 0.9
+        ctx.rotate(-heading)
+        ctx.textAlign = "center"
+        ctx.textBaseline = "top"
+        ctx.fillStyle = "#ffffff"
+
+        for (let dir of ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]) {
+          if (dir.length === 1) {
+            ctx.font = "48px sans-serif"
+            ctx.fillStyle = "#ffffff"
+          } else {
+            ctx.font = "36px sans-serif"
+            ctx.fillStyle = "#cccccc"
+          }
+
+          ctx.fillText(dir, 0, -compass_radius)
+
+          ctx.beginPath()
+          ctx.moveTo(0, -compass_radius - 20)
+          ctx.lineTo(5, -compass_radius - 5)
+          ctx.lineTo(-5, -compass_radius - 5)
+          ctx.fill()
+
+          ctx.rotate(Math.PI / 4)
+        }
+
+        ctx.restore()
+
+      } else {
+        // Draw calibration GUI
+        // Paint background white
+        ctx.fillStyle = "#ffffff"
+        ctx.fillRect(-canvas.width / 2, -canvas.height / 2, canvas.width, canvas.height)
+
+        // Add the most recent data point to the calibration data
+        calibration_data_raw[0].push(magnet_data[0])
+        calibration_data_raw[1].push(magnet_data[1])
+        calibration_data_raw[2].push(magnet_data[2])
+
+        let calibration_data = []
+        for (let i = 0; i < 3; i++) {
+          calibration_data.push(calibration_data_raw[i].map((n) => n + hard_iron_offsets[i]))
+        }
+
+        let merged_data_points = [].concat(calibration_data[0], calibration_data[1], calibration_data[2])
+
+        let plot_size = (Math.max(...merged_data_points) - Math.min(...merged_data_points)) * 1.2
+        let plot_center = (Math.max(...merged_data_points) + Math.min(...merged_data_points)) / 2
+
+        let scale = Math.min(canvas.width, canvas.height) / plot_size
+        ctx.scale(scale, scale)
+
+        // ctx.strokeRect(-plot_size / 2, -plot_size / 2, plot_size, plot_size)
+
+        ctx.scale(1, -1) // flip y-axis so up is positive
+        ctx.translate(-plot_center, -plot_center)
+
+        ctx.strokeStyle = "#000000"
+        ctx.lineWidth = 1.0 / scale
+
+        // Draw axes
+        ctx.beginPath()
+        ctx.moveTo(-canvas.width / scale / 2 + plot_center, 0)
+        ctx.lineTo(canvas.width / scale / 2 + plot_center, 0)
+        ctx.stroke()
+
+        ctx.beginPath()
+        ctx.moveTo(0, -canvas.height / scale / 2 + plot_center)
+        ctx.lineTo(0, canvas.height / scale / 2 + plot_center)
+        ctx.stroke()
+
+        // Plot calibration data
+        // 3d data is projected onto the 2d plane along three different axes, each in a different color
+        let radius = 2.0 / scale
+
+        for(let i = 0; i < calibration_data[0].length; i++) {
+          ctx.fillStyle = "#ff0000"
+          ctx.beginPath()
+          ctx.arc(calibration_data[0][i], calibration_data[1][i], radius, 0, 2 * Math.PI)
+          ctx.fill()
+          ctx.beginPath()
+          ctx.fillStyle = "#00ff00"
+          ctx.arc(calibration_data[1][i], calibration_data[2][i], radius, 0, 2 * Math.PI)
+          ctx.fill()
+          ctx.beginPath()
+          ctx.fillStyle = "#0000ff"
+          ctx.arc(calibration_data[2][i], calibration_data[0][i], radius, 0, 2 * Math.PI)
+          ctx.fill()
+        }
+      }
+
+      ctx.restore()
+    }
+
+    // // Update the page manually, for debugging
+    // last_data = {
+    //   "raw": {
+    //     "accel": [-0.1, 0.1, -1],
+    //     "gyro": [0, 0, 0],
+    //     "magnet": [10, -20, 30],
+    //   },
+    //   "calibration": {
+    //     "hard_iron_offsets": [10, 10, 0],
+    //     "declination": 0
+    //   }
+    // }
+    // updatePage(last_data)
+
+    window.addEventListener('resize', () => updatePage(last_data))
+
+    function tare() {
+      // Adjust the accelerometer rotation matrix so the current position is now considered level
+      if (last_data === null) {
+        return
+      }
+
+      let current_accel = normalize(last_data["raw"]["accel"])
+      let cross = crossProduct(current_accel, [0, 0, -1])
+      let skew_cross_product = [
+              [0, -cross[2], cross[1]],
+              [cross[2], 0, -cross[0]],
+              [-cross[1], cross[0], 0]
+      ]
+
+      let identity = [
+              [1, 0, 0],
+              [0, 1, 0],
+              [0, 0, 1]
+      ]
+
+      let dot = dotProduct(current_accel, [-1, 0, 0])
+      tare_rotation_matrix = matrixAdd(identity, matrixAdd(skew_cross_product, elementwiseMultiply(matrixMultiply(skew_cross_product, skew_cross_product), 1 / (1 + dot))))
+
+      updatePage(last_data)
+    }
+
+    function resetTare() {
+      tare_rotation_matrix = [
+              [1, 0, 0],
+              [0, 1, 0],
+              [0, 0, 1]
+      ]
+
+      updatePage(last_data)
+    }
+
+    function toggleCalibration() {
+      calibrating = !calibrating
+      calibration_data_raw = [[], [], []]
+
+      document.getElementById("toggle-calibration").innerText = calibrating ? "Show Level" : "Show Compass Calibration"
+
+      if (calibrating) {
+        document.getElementById("button-tray").classList.add("calibrating")
+      } else {
+        document.getElementById("button-tray").classList.remove("calibrating")
+      }
+
+      updatePage(last_data)
+    }
+
+    function calibrate() {
+      // Use stored calibration data to calculate hard iron magnetometer offsets
+      let offsets = []
+      for (let axis = 0; axis < 3; axis++) {
+        let center = (Math.min(...calibration_data_raw[axis]) + Math.max(...calibration_data_raw[axis])) / 2
+        offsets.push(-center)
+      }
+
+      // Send new offsets to the server
+      if (socket !== null && socket.readyState === socket.OPEN) {
+        socket.send(JSON.stringify({
+          "type": "calibration_set",
+          "key": "hard_iron_offsets",
+          "value": offsets
+        }))
+      }
+    }
+
+    function resetCalibration() {
+      if (socket !== null && socket.readyState === socket.OPEN) {
+        socket.send(JSON.stringify({
+          "type": "calibration_set",
+          "key": "hard_iron_offsets",
+          "value": [0, 0, 0]
+        }))
+      }
+    }
+
+    // Bind buttons to functions
+    document.getElementById("tare").addEventListener('click', tare);
+    document.getElementById("reset-tare").addEventListener('click', resetTare);
+    document.getElementById("toggle-calibration").addEventListener('click', toggleCalibration);
+    document.getElementById("calibrate").addEventListener('click', calibrate);
+    document.getElementById("reset-calibration").addEventListener('click', resetCalibration);
+
+    document.getElementById("declination").addEventListener('change', () => {
+      // When the declination input is changed by the user, update the server
+      if (socket !== null && socket.readyState === socket.OPEN) {
+        socket.send(JSON.stringify({
+          "type": "calibration_set",
+          "key": "declination",
+          "value": document.getElementById("declination").value
+        }))
+      }
+    });
+
+    function createSocket() {
+      // Create WebSocket connection.
+      socket = new WebSocket("ws://" + window.location.host + ":80")
+
+      // Listen for messages
+      socket.addEventListener("message", (event) => {
+        let data = JSON.parse(event.data)
+
+        last_data = data;
+        updatePage(data)
+      });
+
+      // Restart the connection if it's lost
+      socket.addEventListener("close", (event) => {
+        console.log("Retrying socket connection")
+        createSocket()
+      })
+    }
+
+    createSocket()
+  </script>
+</html>
